@@ -1,0 +1,32 @@
+{
+  "name": "pi-simple-permissions",
+  "version": "0.1.0",
+  "description": "A simple permission gate extension for pi: free writes in CWD, confirm writes outside CWD, confirm bash.",
+  "private": false,
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "permissions",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "author": "Peter Eichinger <peter.eichinger@gmail.com>",
+  "homepage": "https://github.com/petereichinger/pi-simple-permissions#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/petereichinger/pi-simple-permissions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/petereichinger/pi-simple-permissions/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/simple-permissions.ts"
+    ]
+  }
+}
