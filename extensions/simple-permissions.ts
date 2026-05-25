@@ -16,7 +16,9 @@ function escapeRegExp(value: string): string {
 
 function isInside(root: string, target: string): boolean {
 	const rel = relative(root, target);
-	return rel === "" || (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel));
+	return (
+		rel === "" || (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel))
+	);
 }
 
 async function realpathOrResolve(path: string): Promise<string> {
@@ -37,7 +39,9 @@ async function canonicalizeForPolicy(absolutePath: string): Promise<string> {
 	while (true) {
 		try {
 			const real = await realpath(current);
-			return missingParts.length === 0 ? real : resolve(real, ...missingParts);
+			return missingParts.length === 0
+				? real
+				: resolve(real, ...missingParts);
 		} catch {
 			const parent = dirname(current);
 			if (parent === current) return resolve(absolutePath);
@@ -54,27 +58,49 @@ function addExactRule(command: string, rules: BashRule[]): BashRule {
 	return rule;
 }
 
-function allowedByBashRules(command: string, rules: BashRule[]): BashRule | undefined {
+function allowedByBashRules(
+	command: string,
+	rules: BashRule[],
+): BashRule | undefined {
 	return rules.find((rule) => {
 		rule.regex.lastIndex = 0;
 		return rule.regex.test(command);
 	});
 }
 
-async function confirmFileMutation(ctx: any, toolName: string, requestedPath: string, targetReal: string, cwdReal: string) {
-	if (!ctx.hasUI) return { block: true, reason: `Write/edit outside CWD blocked: ${targetReal}` } as const;
+async function confirmFileMutation(
+	ctx: any,
+	toolName: string,
+	requestedPath: string,
+	targetReal: string,
+	cwdReal: string,
+) {
+	if (!ctx.hasUI)
+		return {
+			block: true,
+			reason: `Write/edit outside CWD blocked: ${targetReal}`,
+		} as const;
 
 	const ok = await ctx.ui.confirm(
 		"Allow write outside CWD?",
 		`Tool: ${toolName}\nRequested path: ${requestedPath}\nResolved path: ${targetReal}\nCWD: ${cwdReal}\n\nAllow this file mutation?`,
 	);
 
-	return ok ? undefined : ({ block: true, reason: "Blocked by user" } as const);
+	return ok
+		? undefined
+		: ({ block: true, reason: "Blocked by user" } as const);
 }
 
-async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]) {
+async function confirmBash(
+	ctx: any,
+	command: string,
+	bashAllowRules: BashRule[],
+) {
 	if (!ctx.hasUI) {
-		return { block: true, reason: "Bash command blocked because no UI is available for confirmation" } as const;
+		return {
+			block: true,
+			reason: "Bash command blocked because no UI is available for confirmation",
+		} as const;
 	}
 
 	const choice = await ctx.ui.select(`Allow bash command?\n\n${command}`, [
@@ -93,7 +119,10 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 	}
 
 	if (choice === "Add regex allow rule for this session...") {
-		const source = await ctx.ui.input("Bash allow regex", "Example: ^ssh\\b");
+		const source = await ctx.ui.input(
+			"Bash allow regex",
+			"Example: ^ssh\\b",
+		);
 		if (!source) return { block: true, reason: "Blocked by user" } as const;
 
 		try {
@@ -103,10 +132,16 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 
 			regex.lastIndex = 0;
 			if (regex.test(command)) return undefined;
-			return { block: true, reason: `Added regex /${source}/ does not match this command` } as const;
+			return {
+				block: true,
+				reason: `Added regex /${source}/ does not match this command`,
+			} as const;
 		} catch (error: any) {
 			ctx.ui.notify(`Invalid regex: ${error.message}`, "error");
-			return { block: true, reason: `Invalid regex: ${error.message}` } as const;
+			return {
+				block: true,
+				reason: `Invalid regex: ${error.message}`,
+			} as const;
 		}
 	}
 
@@ -117,18 +152,25 @@ export default function simplePermissions(pi: ExtensionAPI) {
 	const bashAllowRules: BashRule[] = [];
 
 	pi.registerCommand("perm-allow", {
-		description: "Allow matching bash commands for this session. Usage: /perm-allow <regex>",
+		description:
+			"Allow matching bash commands for this session. Usage: /perm-allow <regex>",
 		handler: async (args, ctx) => {
 			const source = args.trim();
 			if (!source) {
-				ctx.ui.notify("Usage: /perm-allow <regex>  e.g. /perm-allow ^ssh\\b", "warning");
+				ctx.ui.notify(
+					"Usage: /perm-allow <regex>  e.g. /perm-allow ^ssh\\b",
+					"warning",
+				);
 				return;
 			}
 
 			try {
 				const regex = new RegExp(source);
 				bashAllowRules.push({ source, regex });
-				ctx.ui.notify(`Added bash allow rule #${bashAllowRules.length}: /${source}/`, "info");
+				ctx.ui.notify(
+					`Added bash allow rule #${bashAllowRules.length}: /${source}/`,
+					"info",
+				);
 			} catch (error: any) {
 				ctx.ui.notify(`Invalid regex: ${error.message}`, "error");
 			}
@@ -136,7 +178,8 @@ export default function simplePermissions(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("perm-allow-exact", {
-		description: "Allow one exact bash command for this session. Usage: /perm-allow-exact <command>",
+		description:
+			"Allow one exact bash command for this session. Usage: /perm-allow-exact <command>",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (!command) {
@@ -145,7 +188,10 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			}
 
 			addExactRule(command, bashAllowRules);
-			ctx.ui.notify(`Added exact bash allow rule #${bashAllowRules.length}`, "info");
+			ctx.ui.notify(
+				`Added exact bash allow rule #${bashAllowRules.length}`,
+				"info",
+			);
 		},
 	});
 
@@ -157,12 +203,18 @@ export default function simplePermissions(pi: ExtensionAPI) {
 				return;
 			}
 
-			ctx.ui.notify(bashAllowRules.map((rule, index) => `${index + 1}. /${rule.source}/`).join("\n"), "info");
+			ctx.ui.notify(
+				bashAllowRules
+					.map((rule, index) => `${index + 1}. /${rule.source}/`)
+					.join("\n"),
+				"info",
+			);
 		},
 	});
 
 	pi.registerCommand("perm-clear", {
-		description: "Clear session bash allow rules. Usage: /perm-clear [all|number]",
+		description:
+			"Clear session bash allow rules. Usage: /perm-clear [all|number]",
 		handler: async (args, ctx) => {
 			const target = args.trim();
 			if (!target || target === "all") {
@@ -172,7 +224,11 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			}
 
 			const index = Number(target) - 1;
-			if (!Number.isInteger(index) || index < 0 || index >= bashAllowRules.length) {
+			if (
+				!Number.isInteger(index) ||
+				index < 0 ||
+				index >= bashAllowRules.length
+			) {
 				ctx.ui.notify("Usage: /perm-clear [all|number]", "warning");
 				return;
 			}
@@ -184,7 +240,10 @@ export default function simplePermissions(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.hasUI) {
-			ctx.ui.setStatus("simple-permissions", ctx.ui.theme.fg("accent", "perm: cwd-write + bash-confirm"));
+			ctx.ui.setStatus(
+				"simple-permissions",
+				ctx.ui.theme.fg("accent", "perm: cwd-write + bash-confirm"),
+			);
 		}
 	});
 
@@ -212,26 +271,12 @@ export default function simplePermissions(pi: ExtensionAPI) {
 
 		if (isInside(cwdReal, targetReal)) return undefined;
 
-		return confirmFileMutation(ctx, event.toolName, inputPath, targetReal, cwdReal);
-	});
-
-	// Also gate user-typed ! / !! shell escapes. If you consider those already
-	// explicit user consent, remove this handler.
-	pi.on("user_bash", async (event, ctx) => {
-		if (allowedByBashRules(event.command, bashAllowRules)) return undefined;
-
-		const blockedResult = {
-			result: {
-				output: "Blocked by simple-permissions extension\n",
-				exitCode: 1,
-				cancelled: false,
-				truncated: false,
-			},
-		};
-
-		if (!ctx.hasUI) return blockedResult;
-
-		const decision = await confirmBash(ctx, event.command, bashAllowRules);
-		return decision ? blockedResult : undefined;
+		return confirmFileMutation(
+			ctx,
+			event.toolName,
+			inputPath,
+			targetReal,
+			cwdReal,
+		);
 	});
 }
