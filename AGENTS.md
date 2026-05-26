@@ -10,7 +10,7 @@ Guidance for coding agents working in this repository.
 - `write` and `edit` outside the current working directory ask the user for confirmation.
 - `bash` tool calls and user `!` / `!!` shell escapes are parsed with `tree-sitter-bash` and classified command-by-command.
 - Known read-only bash commands are allowed automatically.
-- Unknown or potentially mutating bash commands require confirmation unless allowed by a session rule.
+- Unknown or potentially mutating bash commands require confirmation unless allowed by a session, directory, or global allow rule, unless a deny rule matches.
 
 This is **not** a sandbox. It is a pi extension that runs with normal user permissions.
 
@@ -47,15 +47,18 @@ When modifying the extension, preserve these policy expectations unless explicit
 3. Paths are canonicalized through existing parents so symlinks cannot make outside-CWD writes look inside CWD.
 4. Bash analysis is conservative: unknown commands should be treated as potentially harmful.
 5. Shell redirection that writes (`>`, `>>`, `&>`, etc.) makes a command potentially harmful.
-6. Session allow rules are temporary in-memory rules, not persisted.
-7. Non-UI sessions should block operations that require confirmation.
+6. Session allow/deny rules are temporary in-memory rules, while directory/global allow/deny rules may be persisted in JSON config files.
+7. Deny rules override matching allow rules.
+8. Non-UI sessions should block operations that require confirmation.
 
 ## User commands provided by the extension
 
-- `/perm-allow <regex>` — allow matching bash commands for the current session.
-- `/perm-allow-exact <command>` — allow one exact bash command for the current session.
-- `/perm-list` — list current session allow rules.
-- `/perm-clear [all|number]` — clear all rules or a specific numbered rule.
+- `/perm-allow [session|directory|global] <regex>` — allow matching bash commands; scope defaults to session.
+- `/perm-allow-exact [session|directory|global] <command>` — allow one exact bash command; scope defaults to session.
+- `/perm-deny [session|directory|global] <regex>` — deny matching bash commands; scope defaults to session.
+- `/perm-deny-exact [session|directory|global] <command>` — deny one exact bash command; scope defaults to session.
+- `/perm-list [all|session|directory|global]` — list current bash rules.
+- `/perm-clear [session|directory|global] [all|allow|deny|number] [all|number]` — clear rules; scope defaults to session.
 
 ## Development notes
 

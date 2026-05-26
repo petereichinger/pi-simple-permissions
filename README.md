@@ -8,7 +8,7 @@ A small [pi](https://pi.dev) extension that adds a simple permission gate:
 - Fully harmless bash lines are allowed automatically.
 - Potentially harmful agent bash commands require confirmation, with the dialog showing which part is harmless and which part is not.
 - User `!` / `!!` bash commands use the same bash risk analysis.
-- Bash commands can be temporarily allowed for the current session with exact-command or regex rules.
+- Bash commands can be allowed or denied with regex rules at three levels: global config, directory config, and current session.
 
 > This is a convenience guard, not a security sandbox. Pi extensions run with your full user permissions. For hard isolation, use OS permissions, containers, VMs, or sandboxing.
 
@@ -34,39 +34,73 @@ pi -e /path/to/pi-simple-permissions
 
 ## Commands
 
-### `/perm-allow <regex>`
+### Allow and deny rules
 
-Allow matching bash commands for the rest of the current session.
+Rules default to session scope, which lasts only until the current pi session ends. Pass `directory` or `global` as the first argument to persist a rule.
+
+```text
+/perm-allow [session|directory|global] <regex>
+/perm-allow-exact [session|directory|global] <command>
+/perm-deny [session|directory|global] <regex>
+/perm-deny-exact [session|directory|global] <command>
+```
+
+If the scope is omitted, it defaults to `session`.
 
 Examples:
 
 ```text
 /perm-allow ^ssh\b
 /perm-allow ^git\s+(status|diff|log)\b
-/perm-allow ^npm\s+(test|run\s+lint)\b
-```
-
-### `/perm-allow-exact <command>`
-
-Allow one exact bash command for the rest of the current session.
-
-```text
 /perm-allow-exact ssh myhost uptime
+/perm-deny ^sudo\b
+/perm-allow directory ^npm\s+test$
+/perm-deny global ^sudo\b
 ```
 
-### `/perm-list`
+### Persistent directory and global rules
 
-List current session bash allow rules.
+Directory rules are saved in `.pi/simple-permissions.json` under the current pi working directory. Global rules are saved in `$XDG_CONFIG_HOME/pi-simple-permissions/config.json`, or `~/.config/pi-simple-permissions/config.json` when `XDG_CONFIG_HOME` is not set.
 
-### `/perm-clear [all|number]`
-
-Clear all rules or a single numbered rule from `/perm-list`.
+Use the optional scope argument to persist rules:
 
 ```text
-/perm-clear
-/perm-clear all
-/perm-clear 2
+/perm-allow directory <regex>
+/perm-allow-exact directory <command>
+/perm-deny global <regex>
+/perm-deny-exact global <command>
 ```
+
+The bash confirmation dialog can also save allow rules for the current directory.
+
+### Listing and clearing rules
+
+```text
+/perm-list [all|session|directory|global]
+/perm-clear [session|directory|global] [all|allow|deny|number] [all|number]
+```
+
+For backwards compatibility, `/perm-clear 2` removes session allow rule #2. Persistent rules are cleared with commands such as `/perm-clear directory allow 2` or `/perm-clear global deny all`.
+
+## Persistent config format
+
+Both persistent config files use the same JSON shape. Rules can be plain regex strings or objects with a `source` regex and optional `description`; exact-command commands store anchored escaped regexes.
+
+```json
+{
+  "version": 1,
+  "bash": {
+    "allow": [
+      { "source": "^npm\\s+test$", "description": "Project test command" }
+    ],
+    "deny": [
+      { "source": "^sudo\\b", "description": "Never allow sudo here" }
+    ]
+  }
+}
+```
+
+Deny rules win over allow rules. For allows, more-specific scopes are checked before broader scopes: session, directory, then global.
 
 ## Bash risk analysis and confirmation dialog
 
@@ -79,7 +113,9 @@ When a potentially harmful bash command is requested, the dialog shows each comm
 - Allow once
 - Block
 - Allow the exact command for this session
+- Allow the exact command for this directory
 - Add a regex allow rule for this session
+- Add a regex allow rule for this directory
 
 ## Important caveats
 
@@ -89,3 +125,5 @@ When a potentially harmful bash command is requested, the dialog shows each comm
 - Other custom extensions/tools may mutate files internally and bypass this policy. Only run trusted extensions.
 - Bash risk analysis is conservative, not a sandbox or proof of safety. Unknown commands are considered potentially harmful, while allow rules can bypass analysis.
 - Regex allow rules are powerful. For example, `/perm-allow ^ssh\b` allows any bash command beginning with `ssh` for the session.
+- Persistent rules are normal JSON files. Review them before sharing a project, especially directory rules under `.pi/`.
+- Deny rules are hard blocks and override matching allow rules at any scope.

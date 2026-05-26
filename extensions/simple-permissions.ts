@@ -1,11 +1,46 @@
-import { realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // tree-sitter and tree-sitter-bash are CommonJS packages without consistently
 // available TS declarations in extension runtimes, so load them lazily via
 // dynamic import and keep their values typed as any.
-type BashRule = { source: string; regex: RegExp };
+type BashRuleScope = "session" | "directory" | "global";
+type BashRuleList = "allow" | "deny";
+type BashRule = {
+	source: string;
+	regex: RegExp;
+	scope: BashRuleScope;
+	list: BashRuleList;
+	description?: string;
+};
+type StoredBashRule = string | { source?: unknown; description?: unknown };
+type PermissionConfig = {
+	version?: number;
+	bash?: {
+		allow?: StoredBashRule[];
+		deny?: StoredBashRule[];
+	};
+	// Legacy/experimental shape support, if users created configs from early docs.
+	bashAllowRules?: StoredBashRule[];
+};
+type LoadedConfigFile = {
+	path: string;
+	scope: Exclude<BashRuleScope, "session">;
+	config: PermissionConfig;
+	allowRules: BashRule[];
+	denyRules: BashRule[];
+	errors: string[];
+};
+type LoadedConfigState = {
+	cwd: string;
+	global: LoadedConfigFile;
+	directory: LoadedConfigFile;
+	allowRules: BashRule[];
+	denyRules: BashRule[];
+	errors: string[];
+};
 type BashCommandRisk = {
 	command: string;
 	name: string;
@@ -83,6 +118,8 @@ const GIT_READ_ONLY_SUBCOMMANDS = new Set([
 ]);
 const FIND_MUTATING_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf"]);
 let bashParserPromise: Promise<any | null> | undefined;
+let configCache: LoadedConfigState | undefined;
+let configLoadPromise: { cwd: string; promise: Promise<LoadedConfigState> } | undefined;
 
 function stripAtPrefix(path: string): string {
 	return path.startsWith("@") ? path.slice(1) : path;
@@ -125,18 +162,190 @@ async function canonicalizeForPolicy(absolutePath: string): Promise<string> {
 	}
 }
 
-function addExactRule(command: string, rules: BashRule[]): BashRule {
-	const source = `^${escapeRegExp(command)}$`;
-	const rule = { source, regex: new RegExp(source) };
+function exactRuleSource(command: string): string {
+	return `^${escapeRegExp(command)}$`;
+}
+
+function addRule(source: string, rules: BashRule[], scope: BashRuleScope, list: BashRuleList): BashRule {
+	const rule = { source, regex: new RegExp(source), scope, list };
 	rules.push(rule);
 	return rule;
 }
 
-function allowedByBashRules(command: string, rules: BashRule[]): BashRule | undefined {
+function addExactRule(command: string, rules: BashRule[], scope: BashRuleScope, list: BashRuleList): BashRule {
+	return addRule(exactRuleSource(command), rules, scope, list);
+}
+
+function matchingBashRule(command: string, rules: BashRule[]): BashRule | undefined {
 	return rules.find((rule) => {
 		rule.regex.lastIndex = 0;
 		return rule.regex.test(command);
 	});
+}
+
+function getGlobalConfigPath(): string {
+	const base = process.env.XDG_CONFIG_HOME ? resolve(process.env.XDG_CONFIG_HOME) : join(homedir(), ".config");
+	return join(base, "pi-simple-permissions", "config.json");
+}
+
+function getDirectoryConfigPath(cwd: string): string {
+	return resolve(cwd, ".pi", "simple-permissions.json");
+}
+
+function defaultConfig(): PermissionConfig {
+	return { version: 1, bash: { allow: [], deny: [] } };
+}
+
+function normalizeConfig(value: unknown): PermissionConfig {
+	const config = value && typeof value === "object" && !Array.isArray(value) ? (value as PermissionConfig) : defaultConfig();
+	config.version ??= 1;
+	config.bash = config.bash && typeof config.bash === "object" && !Array.isArray(config.bash) ? config.bash : {};
+	config.bash.allow = Array.isArray(config.bash.allow) ? config.bash.allow : [];
+	config.bash.deny = Array.isArray(config.bash.deny) ? config.bash.deny : [];
+	if (Array.isArray(config.bashAllowRules) && config.bash.allow.length === 0) {
+		config.bash.allow = config.bashAllowRules;
+	}
+	return config;
+}
+
+function storedRuleSource(entry: StoredBashRule): { source?: string; description?: string } {
+	if (typeof entry === "string") return { source: entry };
+	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return {};
+	return {
+		source: typeof entry.source === "string" ? entry.source : undefined,
+		description: typeof entry.description === "string" ? entry.description : undefined,
+	};
+}
+
+function compileStoredRules(
+	entries: StoredBashRule[] | undefined,
+	scope: Exclude<BashRuleScope, "session">,
+	list: BashRuleList,
+	path: string,
+): { rules: BashRule[]; errors: string[] } {
+	const rules: BashRule[] = [];
+	const errors: string[] = [];
+	for (const [index, entry] of (entries ?? []).entries()) {
+		const { source, description } = storedRuleSource(entry);
+		if (!source) {
+			errors.push(`${path}: ignored ${scope} ${list} rule #${index + 1}: missing string source`);
+			continue;
+		}
+		try {
+			rules.push({ source, regex: new RegExp(source), scope, list, description });
+		} catch (error: any) {
+			errors.push(`${path}: ignored ${scope} ${list} rule #${index + 1} /${source}/: ${error.message}`);
+		}
+	}
+	return { rules, errors };
+}
+
+async function loadConfigFile(path: string, scope: Exclude<BashRuleScope, "session">): Promise<LoadedConfigFile> {
+	let parsed: unknown;
+	const errors: string[] = [];
+	try {
+		parsed = JSON.parse(await readFile(path, "utf8"));
+	} catch (error: any) {
+		if (error?.code !== "ENOENT") errors.push(`${path}: failed to read config: ${error.message}`);
+		parsed = defaultConfig();
+	}
+
+	const config = normalizeConfig(parsed);
+	const allow = compileStoredRules(config.bash?.allow, scope, "allow", path);
+	const deny = compileStoredRules(config.bash?.deny, scope, "deny", path);
+	return {
+		path,
+		scope,
+		config,
+		allowRules: allow.rules,
+		denyRules: deny.rules,
+		errors: [...errors, ...allow.errors, ...deny.errors],
+	};
+}
+
+async function loadConfigs(cwd: string): Promise<LoadedConfigState> {
+	if (configCache?.cwd === cwd) return configCache;
+	if (configLoadPromise?.cwd === cwd) return configLoadPromise.promise;
+	const promise = (async () => {
+		const [globalConfig, directoryConfig] = await Promise.all([
+			loadConfigFile(getGlobalConfigPath(), "global"),
+			loadConfigFile(getDirectoryConfigPath(cwd), "directory"),
+		]);
+		const state: LoadedConfigState = {
+			cwd,
+			global: globalConfig,
+			directory: directoryConfig,
+			// More-specific allow rules are checked first. Denies win regardless of scope.
+			allowRules: [...directoryConfig.allowRules, ...globalConfig.allowRules],
+			denyRules: [...directoryConfig.denyRules, ...globalConfig.denyRules],
+			errors: [...globalConfig.errors, ...directoryConfig.errors],
+		};
+		configCache = state;
+		return state;
+	})();
+	configLoadPromise = { cwd, promise };
+	try {
+		return await promise;
+	} finally {
+		if (configLoadPromise?.promise === promise) configLoadPromise = undefined;
+	}
+}
+
+function invalidateConfigCache() {
+	configCache = undefined;
+	configLoadPromise = undefined;
+}
+
+async function saveConfigFile(path: string, config: PermissionConfig) {
+	await mkdir(dirname(path), { recursive: true });
+	const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+	await writeFile(tmpPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+	await rename(tmpPath, path);
+}
+
+async function addPersistentRule(ctx: any, scope: Exclude<BashRuleScope, "session">, list: BashRuleList, source: string) {
+	// Validate before saving so a typo cannot poison every future session.
+	new RegExp(source);
+	const path = scope === "global" ? getGlobalConfigPath() : getDirectoryConfigPath(ctx.cwd);
+	const file = await loadConfigFile(path, scope);
+	file.config.bash ??= { allow: [], deny: [] };
+	file.config.bash.allow ??= [];
+	file.config.bash.deny ??= [];
+	file.config.bash[list]!.push({ source });
+	await saveConfigFile(path, file.config);
+	invalidateConfigCache();
+}
+
+async function clearPersistentRule(ctx: any, scope: Exclude<BashRuleScope, "session">, list: BashRuleList, target: string) {
+	const path = scope === "global" ? getGlobalConfigPath() : getDirectoryConfigPath(ctx.cwd);
+	const file = await loadConfigFile(path, scope);
+	file.config.bash ??= { allow: [], deny: [] };
+	file.config.bash.allow ??= [];
+	file.config.bash.deny ??= [];
+	const rules = file.config.bash[list]!;
+	if (target === "all") {
+		rules.splice(0, rules.length);
+	} else {
+		const index = Number(target) - 1;
+		if (!Number.isInteger(index) || index < 0 || index >= rules.length) {
+			throw new Error(`No ${scope} ${list} rule #${target}`);
+		}
+		rules.splice(index, 1);
+	}
+	await saveConfigFile(path, file.config);
+	invalidateConfigCache();
+}
+
+function ruleLabel(rule: BashRule): string {
+	return `${rule.scope} ${rule.list} rule /${rule.source}/`;
+}
+
+function bashRuleDecision(command: string, sessionAllowRules: BashRule[], sessionDenyRules: BashRule[], config: LoadedConfigState) {
+	const deny = matchingBashRule(command, [...sessionDenyRules, ...config.denyRules]);
+	if (deny) return { type: "deny" as const, rule: deny };
+	const allow = matchingBashRule(command, [...sessionAllowRules, ...config.allowRules]);
+	if (allow) return { type: "allow" as const, rule: allow };
+	return undefined;
 }
 
 async function confirmFileMutation(ctx: any, toolName: string, requestedPath: string, targetReal: string, cwdReal: string) {
@@ -313,7 +522,14 @@ function formatBashAnalysis(analysis: BashAnalysis): string {
 }
 
 async function selectBashDecision(ctx: any, command: string, analysis: BashAnalysis): Promise<string | undefined> {
-	const choices = ["Allow once", "Block", "Allow exact command for this session", "Add regex allow rule for this session..."];
+	const choices = [
+		"Allow once",
+		"Block",
+		"Allow exact command for this session",
+		"Allow exact command for this directory",
+		"Add regex allow rule for this session...",
+		"Add regex allow rule for this directory...",
+	];
 
 	return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: (value: string | undefined) => void) => {
 		let selected = 0;
@@ -434,19 +650,36 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 	if (choice === "Allow once") return undefined;
 
 	if (choice === "Allow exact command for this session") {
-		addExactRule(command, bashAllowRules);
+		addExactRule(command, bashAllowRules, "session", "allow");
 		ctx.ui.notify("Added exact bash allow rule for this session.", "info");
 		return undefined;
 	}
 
-	if (choice === "Add regex allow rule for this session...") {
+	if (choice === "Allow exact command for this directory") {
+		try {
+			await addPersistentRule(ctx, "directory", "allow", exactRuleSource(command));
+			ctx.ui.notify("Added exact bash allow rule for this directory.", "info");
+			return undefined;
+		} catch (error: any) {
+			ctx.ui.notify(`Could not save directory rule: ${error.message}`, "error");
+			return { block: true, reason: `Could not save directory rule: ${error.message}` } as const;
+		}
+	}
+
+	if (choice === "Add regex allow rule for this session..." || choice === "Add regex allow rule for this directory...") {
+		const persistent = choice === "Add regex allow rule for this directory...";
 		const source = await ctx.ui.input("Bash allow regex", "Example: ^ssh\\b");
 		if (!source) return { block: true, reason: "Blocked by user" } as const;
 
 		try {
 			const regex = new RegExp(source);
-			bashAllowRules.push({ source, regex });
-			ctx.ui.notify(`Added bash allow rule: /${source}/`, "info");
+			if (persistent) {
+				await addPersistentRule(ctx, "directory", "allow", source);
+				ctx.ui.notify(`Added directory bash allow rule: /${source}/`, "info");
+			} else {
+				bashAllowRules.push({ source, regex, scope: "session", list: "allow" });
+				ctx.ui.notify(`Added session bash allow rule: /${source}/`, "info");
+			}
 
 			regex.lastIndex = 0;
 			if (regex.test(command)) return undefined;
@@ -462,89 +695,157 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 
 export default function simplePermissions(pi: ExtensionAPI) {
 	const bashAllowRules: BashRule[] = [];
+	const bashDenyRules: BashRule[] = [];
 
-	pi.registerCommand("perm-allow", {
-		description: "Allow matching bash commands for this session. Usage: /perm-allow <regex>",
-		handler: async (args, ctx) => {
-			const source = args.trim();
-			if (!source) {
-				ctx.ui.notify("Usage: /perm-allow <regex>  e.g. /perm-allow ^ssh\\b", "warning");
-				return;
-			}
+	const splitOptionalScope = (raw: string): { scope: BashRuleScope; value: string } => {
+		const trimmed = raw.trim();
+		const match = trimmed.match(/^(session|directory|global)(?:\s+|$)/);
+		if (!match) return { scope: "session", value: trimmed };
+		return { scope: match[1] as BashRuleScope, value: trimmed.slice(match[0].length).trim() };
+	};
 
-			try {
-				const regex = new RegExp(source);
-				bashAllowRules.push({ source, regex });
-				ctx.ui.notify(`Added bash allow rule #${bashAllowRules.length}: /${source}/`, "info");
-			} catch (error: any) {
-				ctx.ui.notify(`Invalid regex: ${error.message}`, "error");
-			}
-		},
-	});
+	const addScopedRule = async (ctx: any, scope: BashRuleScope, list: BashRuleList, source: string) => {
+		if (scope === "session") {
+			const rules = list === "allow" ? bashAllowRules : bashDenyRules;
+			addRule(source, rules, "session", list);
+			ctx.ui.notify(`Added session bash ${list} rule #${rules.length}: /${source}/`, "info");
+			return;
+		}
+		await addPersistentRule(ctx, scope, list, source);
+		ctx.ui.notify(`Added ${scope} bash ${list} rule: /${source}/`, "info");
+	};
 
-	pi.registerCommand("perm-allow-exact", {
-		description: "Allow one exact bash command for this session. Usage: /perm-allow-exact <command>",
-		handler: async (args, ctx) => {
-			const command = args.trim();
-			if (!command) {
-				ctx.ui.notify("Usage: /perm-allow-exact <command>", "warning");
-				return;
-			}
+	const registerRuleCommand = (name: string, list: BashRuleList, exact: boolean) => {
+		pi.registerCommand(name, {
+			description: `${list === "allow" ? "Allow" : "Deny"} ${exact ? "one exact" : "matching"} bash command${exact ? "" : "s"}. Usage: /${name} [session|directory|global] <${exact ? "command" : "regex"}>`,
+			handler: async (args, ctx) => {
+				const { scope, value } = splitOptionalScope(args);
+				if (!value) {
+					ctx.ui.notify(`Usage: /${name} [session|directory|global] <${exact ? "command" : "regex"}>`, "warning");
+					return;
+				}
 
-			addExactRule(command, bashAllowRules);
-			ctx.ui.notify(`Added exact bash allow rule #${bashAllowRules.length}`, "info");
-		},
-	});
+				try {
+					await addScopedRule(ctx, scope, list, exact ? exactRuleSource(value) : value);
+				} catch (error: any) {
+					ctx.ui.notify(`Could not add ${scope} ${list} rule: ${error.message}`, "error");
+				}
+			},
+		});
+	};
+
+	registerRuleCommand("perm-allow", "allow", false);
+	registerRuleCommand("perm-allow-exact", "allow", true);
+	registerRuleCommand("perm-deny", "deny", false);
+	registerRuleCommand("perm-deny-exact", "deny", true);
 
 	pi.registerCommand("perm-list", {
-		description: "List current session bash allow rules",
-		handler: async (_args, ctx) => {
-			if (bashAllowRules.length === 0) {
-				ctx.ui.notify("No bash allow rules for this session.", "info");
+		description: "List bash allow/deny rules. Usage: /perm-list [all|session|directory|global]",
+		handler: async (args, ctx) => {
+			const scope = args.trim() || "all";
+			if (!["all", "session", "directory", "global"].includes(scope)) {
+				ctx.ui.notify("Usage: /perm-list [all|session|directory|global]", "warning");
 				return;
 			}
 
-			ctx.ui.notify(bashAllowRules.map((rule, index) => `${index + 1}. /${rule.source}/`).join("\n"), "info");
+			const config = await loadConfigs(ctx.cwd);
+			const sections: string[] = [];
+			const addSection = (title: string, rules: BashRule[]) => {
+				if (rules.length === 0) return false;
+				sections.push(`${title}:`);
+				sections.push(...rules.map((rule, index) => `  ${index + 1}. /${rule.source}/${rule.description ? ` — ${rule.description}` : ""}`));
+				return true;
+			};
+			const addScopedSections = (title: string, allowRules: BashRule[], denyRules: BashRule[], path?: string) => {
+				if (allowRules.length === 0 && denyRules.length === 0) return false;
+				if (path) sections.push(`${title} config: ${path}`);
+				addSection(`${title} allow`, allowRules);
+				addSection(`${title} deny`, denyRules);
+				return true;
+			};
+
+			if (scope === "all" || scope === "session") {
+				addScopedSections("Session", bashAllowRules, bashDenyRules);
+			}
+			if (scope === "all" || scope === "directory") {
+				addScopedSections("Directory", config.directory.allowRules, config.directory.denyRules, config.directory.path);
+			}
+			if (scope === "all" || scope === "global") {
+				addScopedSections("Global", config.global.allowRules, config.global.denyRules, config.global.path);
+			}
+			if (config.errors.length > 0) sections.push("", "Config warnings:", ...config.errors.map((error) => `  ${error}`));
+
+			ctx.ui.notify(sections.length === 0 ? "No bash rules." : sections.join("\n"), "info");
 		},
 	});
 
 	pi.registerCommand("perm-clear", {
-		description: "Clear session bash allow rules. Usage: /perm-clear [all|number]",
+		description: "Clear bash rules. Usage: /perm-clear [session|directory|global] [all|allow|deny|number] [all|number]",
 		handler: async (args, ctx) => {
-			const target = args.trim();
-			if (!target || target === "all") {
-				bashAllowRules.splice(0, bashAllowRules.length);
-				ctx.ui.notify("Cleared all bash allow rules.", "info");
-				return;
+			const { scope, value } = splitOptionalScope(args);
+			const parts = value.split(/\s+/).filter(Boolean);
+			const clearSessionRules = (rules: BashRule[], list: BashRuleList, target: string | undefined) => {
+				if (!target || target === "all") {
+					rules.splice(0, rules.length);
+					ctx.ui.notify(`Cleared session bash ${list} rules.`, "info");
+					return;
+				}
+				const index = Number(target) - 1;
+				if (!Number.isInteger(index) || index < 0 || index >= rules.length) {
+					ctx.ui.notify("Usage: /perm-clear [session|directory|global] [all|allow|deny|number] [all|number]", "warning");
+					return;
+				}
+				const [removed] = rules.splice(index, 1);
+				ctx.ui.notify(`Removed session ${list} rule: /${removed.source}/`, "info");
+			};
+
+			if (scope === "session") {
+				if (parts.length === 0 || parts[0] === "all") {
+					bashAllowRules.splice(0, bashAllowRules.length);
+					bashDenyRules.splice(0, bashDenyRules.length);
+					ctx.ui.notify("Cleared all session bash rules.", "info");
+					return;
+				}
+				if (parts[0] === "allow") return clearSessionRules(bashAllowRules, "allow", parts[1]);
+				if (parts[0] === "deny") return clearSessionRules(bashDenyRules, "deny", parts[1]);
+				return clearSessionRules(bashAllowRules, "allow", parts[0]);
 			}
 
-			const index = Number(target) - 1;
-			if (!Number.isInteger(index) || index < 0 || index >= bashAllowRules.length) {
-				ctx.ui.notify("Usage: /perm-clear [all|number]", "warning");
+			const [list, target] = parts;
+			if ((list !== "allow" && list !== "deny") || !target) {
+				ctx.ui.notify("Usage: /perm-clear <directory|global> <allow|deny> <all|number>", "warning");
 				return;
 			}
-
-			const [removed] = bashAllowRules.splice(index, 1);
-			ctx.ui.notify(`Removed rule: /${removed.source}/`, "info");
+			try {
+				await clearPersistentRule(ctx, scope, list, target);
+				ctx.ui.notify(`Cleared ${scope} ${list} rule${target === "all" ? "s" : ` #${target}`}.`, "info");
+			} catch (error: any) {
+				ctx.ui.notify(`Could not clear ${scope} rule: ${error.message}`, "error");
+			}
 		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		const config = await loadConfigs(ctx.cwd);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("simple-permissions", ctx.ui.theme.fg("accent", "perm: cwd-write + bash-risk"));
+			if (config.errors.length > 0) ctx.ui.notify(`simple-permissions config warnings:\n${config.errors.join("\n")}`, "warning");
 		}
 	});
 
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			"\n\nPermission policy active: read/list/search tools are allowed; write/edit targets inside the current working directory are allowed; write/edit targets outside the current working directory require user confirmation; bash commands are parsed with tree-sitter-bash and each simple command is classified as harmless or potentially harmful. Fully harmless bash lines are allowed automatically; potentially harmful bash lines require user confirmation unless they match a session allow regex added by /perm-allow or by the bash confirmation dialog.",
+			"\n\nPermission policy active: read/list/search tools are allowed; write/edit targets inside the current working directory are allowed; write/edit targets outside the current working directory require user confirmation; bash commands are parsed with tree-sitter-bash and each simple command is classified as harmless or potentially harmful. Fully harmless bash lines are allowed automatically; potentially harmful bash lines require confirmation unless they match a session, directory, or global bash allow regex. Matching deny regexes override allows and block the bash command.",
 	}));
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "bash") {
 			const command = String((event.input as any).command ?? "");
-			if (allowedByBashRules(command, bashAllowRules)) return undefined;
+			const config = await loadConfigs(ctx.cwd);
+			const decision = bashRuleDecision(command, bashAllowRules, bashDenyRules, config);
+			if (decision?.type === "allow") return undefined;
+			if (decision?.type === "deny") return { block: true, reason: `Bash command denied by ${ruleLabel(decision.rule)}` } as const;
 			return confirmBash(ctx, command, bashAllowRules);
 		}
 
@@ -565,7 +866,19 @@ export default function simplePermissions(pi: ExtensionAPI) {
 	// Also gate user-typed ! / !! shell escapes. If you consider those already
 	// explicit user consent, remove this handler.
 	pi.on("user_bash", async (event, ctx) => {
-		if (allowedByBashRules(event.command, bashAllowRules)) return undefined;
+		const config = await loadConfigs(ctx.cwd);
+		const ruleDecision = bashRuleDecision(event.command, bashAllowRules, bashDenyRules, config);
+		if (ruleDecision?.type === "allow") return undefined;
+		if (ruleDecision?.type === "deny") {
+			return {
+				result: {
+					output: `Blocked by simple-permissions extension\nBash command denied by ${ruleLabel(ruleDecision.rule)}\n`,
+					exitCode: 1,
+					cancelled: false,
+					truncated: false,
+				},
+			};
+		}
 
 		const decision = await confirmBash(ctx, event.command, bashAllowRules);
 		if (!decision) return undefined;
