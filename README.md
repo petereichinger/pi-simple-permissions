@@ -36,7 +36,7 @@ pi -e /path/to/pi-simple-permissions
 
 ### Allow and deny rules
 
-Rules default to session scope, which lasts only until the current pi session ends. Pass `directory` or `global` as the first argument to persist a rule.
+Rules default to session scope. Session rules are stored in the current pi session log, so they survive `/reload` and quitting/resuming that session, but they do not become project-wide or global defaults. Pass `directory` or `global` as the first argument to persist a rule outside the session.
 
 ```text
 /perm-allow [session|directory|global] <regex>
@@ -58,9 +58,9 @@ Examples:
 /perm-deny global ^sudo\b
 ```
 
-### Persistent directory and global rules
+### Persistent session, directory, and global rules
 
-Directory rules are saved in `.pi/simple-permissions.json` under the current pi working directory. Global rules are saved in `$XDG_CONFIG_HOME/pi-simple-permissions/config.json`, or `~/.config/pi-simple-permissions/config.json` when `XDG_CONFIG_HOME` is not set.
+Session rules are saved as custom entries in the current pi session file. Directory rules are saved in `.pi/simple-permissions.json` under the current pi working directory. Global rules are saved in `$XDG_CONFIG_HOME/pi-simple-permissions/config.json`, or `~/.config/pi-simple-permissions/config.json` when `XDG_CONFIG_HOME` is not set.
 
 Use the optional scope argument to persist rules:
 
@@ -124,6 +124,6 @@ When a potentially harmful bash command is requested, the dialog shows each comm
 - `read`, `ls`, `grep`, and `find` are allowed anywhere by this extension. If you want read/list restrictions too, extend the policy to gate those tools.
 - Other custom extensions/tools may mutate files internally and bypass this policy. Only run trusted extensions.
 - Bash risk analysis is conservative, not a sandbox or proof of safety. Unknown commands are considered potentially harmful, while allow rules can bypass analysis.
-- Regex allow rules are powerful. For example, `/perm-allow ^ssh\b` allows any bash command beginning with `ssh` for the session.
-- Persistent rules are normal JSON files. Review them before sharing a project, especially directory rules under `.pi/`.
+- Regex allow rules are powerful. For example, `/perm-allow ^ssh\b` allows any bash command beginning with `ssh` for the current pi session, including after `/reload` or resuming that session.
+- Directory/global persistent rules are normal JSON files. Review them before sharing a project, especially directory rules under `.pi/`. Session rules live in the pi session file.
 - Deny rules are hard blocks and override matching allow rules at any scope.

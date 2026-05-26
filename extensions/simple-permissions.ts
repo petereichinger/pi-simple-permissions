@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // available TS declarations in extension runtimes, so load them lazily via
 // dynamic import and keep their values typed as any.
 type BashRuleScope = "session" | "directory" | "global";
+type PersistentBashRuleScope = Exclude<BashRuleScope, "session">;
 type BashRuleList = "allow" | "deny";
 type BashRule = {
 	source: string;
@@ -27,7 +28,7 @@ type PermissionConfig = {
 };
 type LoadedConfigFile = {
 	path: string;
-	scope: Exclude<BashRuleScope, "session">;
+	scope: PersistentBashRuleScope;
 	config: PermissionConfig;
 	allowRules: BashRule[];
 	denyRules: BashRule[];
@@ -37,6 +38,11 @@ type LoadedConfigState = {
 	cwd: string;
 	global: LoadedConfigFile;
 	directory: LoadedConfigFile;
+	allowRules: BashRule[];
+	denyRules: BashRule[];
+	errors: string[];
+};
+type LoadedSessionRuleState = {
 	allowRules: BashRule[];
 	denyRules: BashRule[];
 	errors: string[];
@@ -55,6 +61,7 @@ type BashAnalysis = {
 	error?: string;
 };
 
+const SESSION_RULES_ENTRY_TYPE = "simple-permissions-session-rules";
 const WRITING_TOOLS = new Set(["write", "edit"]);
 const READ_ONLY_COMMANDS = new Set([
 	":",
@@ -219,7 +226,7 @@ function storedRuleSource(entry: StoredBashRule): { source?: string; description
 
 function compileStoredRules(
 	entries: StoredBashRule[] | undefined,
-	scope: Exclude<BashRuleScope, "session">,
+	scope: BashRuleScope,
 	list: BashRuleList,
 	path: string,
 ): { rules: BashRule[]; errors: string[] } {
@@ -240,7 +247,7 @@ function compileStoredRules(
 	return { rules, errors };
 }
 
-async function loadConfigFile(path: string, scope: Exclude<BashRuleScope, "session">): Promise<LoadedConfigFile> {
+async function loadConfigFile(path: string, scope: PersistentBashRuleScope): Promise<LoadedConfigFile> {
 	let parsed: unknown;
 	const errors: string[] = [];
 	try {
@@ -296,6 +303,30 @@ function invalidateConfigCache() {
 	configLoadPromise = undefined;
 }
 
+function loadSessionRules(ctx: any): LoadedSessionRuleState {
+	const entries = ctx.sessionManager.getEntries();
+	let latest: unknown;
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === SESSION_RULES_ENTRY_TYPE) latest = entry.data;
+	}
+	if (latest === undefined) return { allowRules: [], denyRules: [], errors: [] };
+
+	const config = normalizeConfig(latest);
+	const allow = compileStoredRules(config.bash?.allow, "session", "allow", "session permissions entry");
+	const deny = compileStoredRules(config.bash?.deny, "session", "deny", "session permissions entry");
+	return { allowRules: allow.rules, denyRules: deny.rules, errors: [...allow.errors, ...deny.errors] };
+}
+
+function persistedSessionRules(allowRules: BashRule[], denyRules: BashRule[]): PermissionConfig {
+	return {
+		version: 1,
+		bash: {
+			allow: allowRules.map((rule) => ({ source: rule.source })),
+			deny: denyRules.map((rule) => ({ source: rule.source })),
+		},
+	};
+}
+
 async function saveConfigFile(path: string, config: PermissionConfig) {
 	await mkdir(dirname(path), { recursive: true });
 	const tmpPath = `${path}.${process.pid}.${Date.now()}.tmp`;
@@ -303,7 +334,7 @@ async function saveConfigFile(path: string, config: PermissionConfig) {
 	await rename(tmpPath, path);
 }
 
-async function addPersistentRule(ctx: any, scope: Exclude<BashRuleScope, "session">, list: BashRuleList, source: string) {
+async function addPersistentRule(ctx: any, scope: PersistentBashRuleScope, list: BashRuleList, source: string) {
 	// Validate before saving so a typo cannot poison every future session.
 	new RegExp(source);
 	const path = scope === "global" ? getGlobalConfigPath() : getDirectoryConfigPath(ctx.cwd);
@@ -316,7 +347,7 @@ async function addPersistentRule(ctx: any, scope: Exclude<BashRuleScope, "sessio
 	invalidateConfigCache();
 }
 
-async function clearPersistentRule(ctx: any, scope: Exclude<BashRuleScope, "session">, list: BashRuleList, target: string) {
+async function clearPersistentRule(ctx: any, scope: PersistentBashRuleScope, list: BashRuleList, target: string) {
 	const path = scope === "global" ? getGlobalConfigPath() : getDirectoryConfigPath(ctx.cwd);
 	const file = await loadConfigFile(path, scope);
 	file.config.bash ??= { allow: [], deny: [] };
@@ -630,7 +661,7 @@ async function selectBashDecision(ctx: any, command: string, analysis: BashAnaly
 	}, { overlay: true });
 }
 
-async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]) {
+async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[], onSessionRulesChanged: () => void = () => {}) {
 	const analysis = await analyzeBash(command);
 	const allHarmless = analysis.commands.every((item) => item.harmless);
 	if (allHarmless) {
@@ -651,6 +682,7 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 
 	if (choice === "Allow exact command for this session") {
 		addExactRule(command, bashAllowRules, "session", "allow");
+		onSessionRulesChanged();
 		ctx.ui.notify("Added exact bash allow rule for this session.", "info");
 		return undefined;
 	}
@@ -678,6 +710,7 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 				ctx.ui.notify(`Added directory bash allow rule: /${source}/`, "info");
 			} else {
 				bashAllowRules.push({ source, regex, scope: "session", list: "allow" });
+				onSessionRulesChanged();
 				ctx.ui.notify(`Added session bash allow rule: /${source}/`, "info");
 			}
 
@@ -696,6 +729,17 @@ async function confirmBash(ctx: any, command: string, bashAllowRules: BashRule[]
 export default function simplePermissions(pi: ExtensionAPI) {
 	const bashAllowRules: BashRule[] = [];
 	const bashDenyRules: BashRule[] = [];
+	let sessionRuleErrors: string[] = [];
+
+	const saveSessionRules = () => {
+		sessionRuleErrors = [];
+		pi.appendEntry(SESSION_RULES_ENTRY_TYPE, persistedSessionRules(bashAllowRules, bashDenyRules));
+	};
+
+	const replaceSessionRules = (allowRules: BashRule[], denyRules: BashRule[]) => {
+		bashAllowRules.splice(0, bashAllowRules.length, ...allowRules);
+		bashDenyRules.splice(0, bashDenyRules.length, ...denyRules);
+	};
 
 	const splitOptionalScope = (raw: string): { scope: BashRuleScope; value: string } => {
 		const trimmed = raw.trim();
@@ -708,6 +752,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 		if (scope === "session") {
 			const rules = list === "allow" ? bashAllowRules : bashDenyRules;
 			addRule(source, rules, "session", list);
+			saveSessionRules();
 			ctx.ui.notify(`Added session bash ${list} rule #${rules.length}: /${source}/`, "info");
 			return;
 		}
@@ -773,7 +818,8 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			if (scope === "all" || scope === "global") {
 				addScopedSections("Global", config.global.allowRules, config.global.denyRules, config.global.path);
 			}
-			if (config.errors.length > 0) sections.push("", "Config warnings:", ...config.errors.map((error) => `  ${error}`));
+			const warnings = [...sessionRuleErrors, ...config.errors];
+			if (warnings.length > 0) sections.push("", "Warnings:", ...warnings.map((error) => `  ${error}`));
 
 			ctx.ui.notify(sections.length === 0 ? "No bash rules." : sections.join("\n"), "info");
 		},
@@ -787,6 +833,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			const clearSessionRules = (rules: BashRule[], list: BashRuleList, target: string | undefined) => {
 				if (!target || target === "all") {
 					rules.splice(0, rules.length);
+					saveSessionRules();
 					ctx.ui.notify(`Cleared session bash ${list} rules.`, "info");
 					return;
 				}
@@ -796,6 +843,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 					return;
 				}
 				const [removed] = rules.splice(index, 1);
+				saveSessionRules();
 				ctx.ui.notify(`Removed session ${list} rule: /${removed.source}/`, "info");
 			};
 
@@ -803,6 +851,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 				if (parts.length === 0 || parts[0] === "all") {
 					bashAllowRules.splice(0, bashAllowRules.length);
 					bashDenyRules.splice(0, bashDenyRules.length);
+					saveSessionRules();
 					ctx.ui.notify("Cleared all session bash rules.", "info");
 					return;
 				}
@@ -826,10 +875,14 @@ export default function simplePermissions(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		const session = loadSessionRules(ctx);
+		replaceSessionRules(session.allowRules, session.denyRules);
+		sessionRuleErrors = session.errors;
 		const config = await loadConfigs(ctx.cwd);
+		const warnings = [...sessionRuleErrors, ...config.errors];
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("simple-permissions", ctx.ui.theme.fg("accent", "perm: cwd-write + bash-risk"));
-			if (config.errors.length > 0) ctx.ui.notify(`simple-permissions config warnings:\n${config.errors.join("\n")}`, "warning");
+			if (warnings.length > 0) ctx.ui.notify(`simple-permissions warnings:\n${warnings.join("\n")}`, "warning");
 		}
 	});
 
@@ -846,7 +899,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			const decision = bashRuleDecision(command, bashAllowRules, bashDenyRules, config);
 			if (decision?.type === "allow") return undefined;
 			if (decision?.type === "deny") return { block: true, reason: `Bash command denied by ${ruleLabel(decision.rule)}` } as const;
-			return confirmBash(ctx, command, bashAllowRules);
+			return confirmBash(ctx, command, bashAllowRules, saveSessionRules);
 		}
 
 		if (!WRITING_TOOLS.has(event.toolName)) return undefined;
@@ -880,7 +933,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 			};
 		}
 
-		const decision = await confirmBash(ctx, event.command, bashAllowRules);
+		const decision = await confirmBash(ctx, event.command, bashAllowRules, saveSessionRules);
 		if (!decision) return undefined;
 
 		return {

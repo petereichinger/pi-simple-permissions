@@ -47,7 +47,7 @@ When modifying the extension, preserve these policy expectations unless explicit
 3. Paths are canonicalized through existing parents so symlinks cannot make outside-CWD writes look inside CWD.
 4. Bash analysis is conservative: unknown commands should be treated as potentially harmful.
 5. Shell redirection that writes (`>`, `>>`, `&>`, etc.) makes a command potentially harmful.
-6. Session allow/deny rules are temporary in-memory rules, while directory/global allow/deny rules may be persisted in JSON config files.
+6. Session allow/deny rules are persisted as custom entries in the current pi session file, while directory/global allow/deny rules may be persisted in JSON config files.
 7. Deny rules override matching allow rules.
 8. Non-UI sessions should block operations that require confirmation.
 
