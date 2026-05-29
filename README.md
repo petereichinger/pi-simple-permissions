@@ -5,8 +5,9 @@ A small [pi](https://pi.dev) extension that adds a simple permission gate:
 - Files inside the current working directory can be read, written, edited, and created without prompting.
 - `write` / `edit` outside the current working directory require confirmation.
 - Agent bash tool calls are parsed with `tree-sitter-bash` and each individual command is labelled harmless or potentially harmful.
-- Fully harmless agent bash lines are allowed automatically.
-- Potentially harmful agent bash tool calls require confirmation, with the dialog showing which part is harmless and which part is not.
+- Bash allow/deny rules apply to each parsed sub-command, not to the full bash line as one string.
+- Fully harmless agent bash lines are allowed automatically unless a deny rule matches one of their parsed sub-commands.
+- Potentially harmful sub-commands require confirmation, with the dialog showing which parts are harmless, already allowed, or still need approval.
 - User-entered `!` / `!!` bash commands are not intercepted by this extension.
 - Agent bash tool calls can be allowed or denied with regex rules at four levels: global config, repo config, directory config, and current session.
 
@@ -36,7 +37,7 @@ pi -e /path/to/pi-simple-permissions
 
 ### Allow and deny rules
 
-Rules default to session scope. Session rules are stored in the current pi session log, so they survive `/reload` and quitting/resuming that session, but they do not become project-wide or global defaults. Pass `directory`, `repo`, or `global` as the first argument to persist a rule outside the session.
+Rules default to session scope. Rules are matched against each parsed bash sub-command, not the whole compound line. Operators such as `&&`, `||`, and `|` are only display context in the dialog; exact and regex rules match the underlying sub-command text itself. Session rules are stored in the current pi session log, so they survive `/reload` and quitting/resuming that session, but they do not become project-wide or global defaults. Pass `directory`, `repo`, or `global` as the first argument to persist a rule outside the session.
 
 ```text
 /perm-allow [session|directory|repo|global] <regex>
@@ -76,7 +77,7 @@ Use the optional scope argument to persist rules:
 
 If you are not inside a Git repository, repo scope is unavailable.
 
-The bash confirmation dialog can also save allow rules for any available scope: session, directory, repo, or global.
+The bash confirmation dialog can also save allow rules for each dangerous sub-command at any available scope: session, directory, repo, or global.
 
 ### Listing and clearing rules
 
@@ -89,7 +90,7 @@ For backwards compatibility, `/perm-clear 2` removes session allow rule #2. Pers
 
 ## Persistent config format
 
-Both persistent config files use the same JSON shape. Rules can be plain regex strings or objects with a `source` regex and optional `description`; exact-command commands store anchored escaped regexes.
+Both persistent config files use the same JSON shape. Rules can be plain regex strings or objects with a `source` regex and optional `description`; exact-command commands store anchored escaped regexes. Each rule is matched against an individual parsed bash sub-command.
 
 ```json
 {
@@ -105,7 +106,7 @@ Both persistent config files use the same JSON shape. Rules can be plain regex s
 }
 ```
 
-Deny rules win over allow rules. For allows, more-specific scopes are checked before broader scopes: session, directory, repo, then global.
+Deny rules win over allow rules. For allows, more-specific scopes are checked before broader scopes: session, directory, repo, then global. Matching happens per parsed sub-command.
 
 ## Bash risk analysis and confirmation dialog
 
@@ -113,10 +114,12 @@ Agent bash tool calls are parsed with Tree-sitter, so compound lines such as `ls
 
 Known read-only commands such as `ls`, `cat`, `grep`, `rg`, safe `find`, safe `sed`, and read-only `git` subcommands are treated as harmless unless they write through shell redirection. Unknown commands and known mutating patterns are treated as potentially harmful.
 
-When a potentially harmful agent bash tool call is requested, the dialog shows each analyzed command part and separates parser errors with a divider instead of folding them into the command list. It uses a two-stage flow:
+When a potentially harmful agent bash tool call is requested, the dialog shows each analyzed command part and separates parser errors with a divider instead of folding them into the command list. Rule saving happens per dangerous parsed sub-command: if some dangerous parts are already allowed by rules, only the remaining dangerous parts are prompted for. For each prompted sub-command, the dialog uses a two-stage flow:
 
-- Stage 1: Allow once, Deny, or Save allow rule
-- Stage 2: choose scope (`session`, `directory`, `repo`, or `global`) and whether to save an exact command or a regex rule
+- Stage 1: `Allow once`, `Deny`, or `Save allow rule`
+- `Allow once` approves the whole bash command once
+- `Save allow rule` switches into per-sub-command rule-saving mode, highlighting one dangerous sub-command at a time
+- In that mode you choose scope (`session`, `directory`, `repo`, or `global`) and exact-vs-regex for the highlighted sub-command, then continue to the next remaining dangerous sub-command
 - If you choose regex, it then prompts for the regex text
 
 ## Important caveats
@@ -126,6 +129,6 @@ When a potentially harmful agent bash tool call is requested, the dialog shows e
 - `read`, `ls`, `grep`, and `find` are allowed anywhere by this extension. If you want read/list restrictions too, extend the policy to gate those tools.
 - Other custom extensions/tools may mutate files internally and bypass this policy. Only run trusted extensions.
 - Bash risk analysis is conservative, not a sandbox or proof of safety. Unknown commands are considered potentially harmful, while allow rules can bypass analysis.
-- Regex allow rules are powerful. For example, `/perm-allow ^ssh\b` allows any bash command beginning with `ssh` for the current pi session, including after `/reload` or resuming that session.
+- Regex allow rules are powerful. For example, `/perm-allow ^ssh\b` allows any parsed bash sub-command beginning with `ssh` for the current pi session, including inside compound lines and after `/reload` or resuming that session.
 - Directory/repo/global persistent rules are normal JSON files. Review them before sharing a project, especially directory rules under `.pi/` and repo rules under the shared Git metadata directory. Session rules live in the pi session file.
 - Deny rules are hard blocks and override matching allow rules at any scope.

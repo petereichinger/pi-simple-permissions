@@ -66,6 +66,17 @@ type BashAnalysis = {
 	commands: BashCommandRisk[];
 	error?: string;
 };
+type BashRuleDecision = { type: "allow" | "deny"; rule: BashRule };
+type EvaluatedBashCommand = BashCommandRisk & {
+	index: number;
+	allowedOnce: boolean;
+	ruleDecision?: BashRuleDecision;
+};
+type BashAnalysisEvaluation = {
+	commands: EvaluatedBashCommand[];
+	denied?: EvaluatedBashCommand;
+	pendingDangerous: EvaluatedBashCommand[];
+};
 type BashSaveMode = "exact" | "regex";
 type BashDialogDecision =
 	| { type: "allow-once" }
@@ -453,12 +464,39 @@ function ruleLabel(rule: BashRule): string {
 	return `${rule.scope} ${rule.list} rule /${rule.source}/`;
 }
 
-function bashRuleDecision(command: string, sessionAllowRules: BashRule[], sessionDenyRules: BashRule[], config: LoadedConfigState) {
+function formatDisplayedBashCommand(command: Pick<BashCommandRisk, "command" | "splitter">): string {
+	return `${command.splitter ? `${command.splitter} ` : ""}${command.command}`;
+}
+
+function bashRuleDecisionForCommand(
+	command: string,
+	sessionAllowRules: BashRule[],
+	sessionDenyRules: BashRule[],
+	config: LoadedConfigState,
+): BashRuleDecision | undefined {
 	const deny = matchingBashRule(command, [...sessionDenyRules, ...config.denyRules]);
-	if (deny) return { type: "deny" as const, rule: deny };
+	if (deny) return { type: "deny", rule: deny };
 	const allow = matchingBashRule(command, [...sessionAllowRules, ...config.allowRules]);
-	if (allow) return { type: "allow" as const, rule: allow };
+	if (allow) return { type: "allow", rule: allow };
 	return undefined;
+}
+
+function evaluateBashAnalysis(
+	analysis: BashAnalysis,
+	allowedOnceIndexes: Set<number>,
+	sessionAllowRules: BashRule[],
+	sessionDenyRules: BashRule[],
+	config: LoadedConfigState,
+): BashAnalysisEvaluation {
+	const commands = analysis.commands.map((item, index) => ({
+		...item,
+		index,
+		allowedOnce: allowedOnceIndexes.has(index),
+		ruleDecision: bashRuleDecisionForCommand(item.command, sessionAllowRules, sessionDenyRules, config),
+	}));
+	const denied = commands.find((item) => item.ruleDecision?.type === "deny");
+	const pendingDangerous = commands.filter((item) => !item.harmless && !item.allowedOnce && item.ruleDecision?.type !== "allow" && item.ruleDecision?.type !== "deny");
+	return { commands, denied, pendingDangerous };
 }
 
 async function confirmFileMutation(ctx: any, toolName: string, requestedPath: string, targetReal: string, cwdReal: string) {
@@ -643,14 +681,17 @@ function formatBashAnalysis(analysis: BashAnalysis): string {
 
 async function selectBashDecision(
 	ctx: any,
+	evaluation: BashAnalysisEvaluation,
 	analysis: BashAnalysis,
+	targetIndex: number,
 	config: LoadedConfigState,
+	initialStage: "action" | "save" = "action",
 ): Promise<BashDialogDecision | undefined> {
 	const actionChoices = ["Allow once", "Deny", "Save allow rule…"];
 	const scopeChoices: BashRuleScope[] = ["session", "directory", ...(config.repoLocation ? (["repo"] as const) : []), "global"];
 
 	return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: (value: BashDialogDecision | undefined) => void) => {
-		let stage: "action" | "save" = "action";
+		let stage: "action" | "save" = initialStage;
 		let actionSelected = 0;
 		let scopeSelected = 0;
 		let saveMode: BashSaveMode = "exact";
@@ -727,13 +768,15 @@ async function selectBashDecision(
 			const wrappedContent = wrapPlain(content, contentWidth);
 			return wrappedContent.map((line, index) => `${index === 0 ? prefix : continuationPrefix}${style(line)}`);
 		};
-		const linesForCommand = (item: BashCommandRisk, width: number) => {
-			const prefix = item.harmless ? "✅ " : "⚠️ ";
-			const splitter = item.splitter ? `${item.splitter} ` : "";
-			const text = `${splitter}${item.command}`;
-			return item.harmless
-				? wrapPrefixed(prefix, text, width)
-				: wrapPrefixed(prefix, text, width, (value) => theme.fg("warning", theme.bold(value)));
+		const linesForCommand = (item: EvaluatedBashCommand, width: number) => {
+			const active = stage === "save" && item.index === targetIndex;
+			const approved = item.harmless || item.allowedOnce || item.ruleDecision?.type === "allow";
+			const text = formatDisplayedBashCommand(item);
+			const prefix = active ? (approved ? "→ ✅ " : "→ ⚠️ ") : approved ? "✅ " : "⚠️ ";
+			if (approved) {
+				return wrapPrefixed(prefix, text, width, (value) => (active ? theme.fg("accent", value) : value));
+			}
+			return wrapPrefixed(prefix, text, width, (value) => (active ? theme.fg("warning", theme.bold(value)) : theme.fg("warning", value)));
 		};
 		const scopeLabel = (scope: BashRuleScope) => `${scope[0]!.toUpperCase()}${scope.slice(1)}`;
 		const modeLabel = (mode: BashSaveMode, label: string) => {
@@ -776,12 +819,13 @@ async function selectBashDecision(
 					stage === "action"
 						? [
 							...wrapInlineChoices(actionChoices, actionSelected, innerWidth),
+							...wrapPrefixed("", "Allow once approves the whole bash command.", innerWidth, (value) => theme.fg("dim", value)),
 							"",
 							...wrapPrefixed("", "←→ or ↑↓ navigate   enter select   escape/ctrl+c cancel", innerWidth, (value) => theme.fg("dim", value)),
 						]
 						: [
 							theme.fg("accent", theme.bold("Save allow rule")),
-							...wrapPrefixed("", "Tab or ←→ switches between exact and regex. ↑↓ chooses scope.", innerWidth, (value) => theme.fg("dim", value)),
+							...wrapPrefixed("", "Applies to the highlighted sub-command. Tab or ←→ switches exact/regex. ↑↓ chooses scope.", innerWidth, (value) => theme.fg("dim", value)),
 							"",
 							theme.fg("accent", "Mode:"),
 							`  ${modeLabel("exact", "Exact command")}`,
@@ -800,8 +844,8 @@ async function selectBashDecision(
 							...wrapPrefixed("", "enter save   escape back   ctrl+c cancel", innerWidth, (value) => theme.fg("dim", value)),
 						];
 				const lines = [
-					theme.fg("accent", theme.bold("Allow bash command?")),
-					...(analysis.commands.length === 0 ? ["✅ No executable commands detected"] : analysis.commands.flatMap((item) => linesForCommand(item, innerWidth))),
+					theme.fg("accent", theme.bold(stage === "action" ? "Allow bash command?" : "Save allow rule for highlighted sub-command")),
+					...(evaluation.commands.length === 0 ? ["✅ No executable commands detected"] : evaluation.commands.flatMap((item) => linesForCommand(item, innerWidth))),
 					...(analysis.parserAvailable || !analysis.error
 						? []
 						: [divider, ...wrapPrefixed("⚠️ Parser error: ", analysis.error, innerWidth, (value) => theme.fg("warning", theme.bold(value)))]),
@@ -841,66 +885,96 @@ async function confirmBash(
 	ctx: any,
 	command: string,
 	bashAllowRules: BashRule[],
+	bashDenyRules: BashRule[],
 	config: LoadedConfigState,
 	onSessionRulesChanged: () => void = () => {},
 ) {
+	let activeConfig = config;
 	const analysis = await analyzeBash(command);
 	const allHarmless = analysis.commands.every((item) => item.harmless);
 	if (allHarmless) {
+		const harmlessEvaluation = evaluateBashAnalysis(analysis, new Set<number>(), bashAllowRules, bashDenyRules, activeConfig);
+		if (harmlessEvaluation.denied) {
+			return {
+				block: true,
+				reason: `Bash sub-command denied by ${ruleLabel(harmlessEvaluation.denied.ruleDecision!.rule)}: ${formatDisplayedBashCommand(harmlessEvaluation.denied)}`,
+			} as const;
+		}
 		if (ctx.hasUI) ctx.ui.notify(`Allowed harmless bash command:\n${formatBashAnalysis(analysis)}`, "info");
 		return undefined;
 	}
 
-	if (!ctx.hasUI) {
-		return {
-			block: true,
-			reason: `Bash command blocked because no UI is available for confirmation.\n${formatBashAnalysis(analysis)}`,
-		} as const;
-	}
-
-	const decision = await selectBashDecision(ctx, analysis, config);
-
-	if (!decision || decision.type === "block") return { block: true, reason: "Blocked by user" } as const;
-	if (decision.type === "allow-once") return undefined;
-
-	if (decision.mode === "exact") {
-		if (decision.scope === "session") {
-			addExactRule(command, bashAllowRules, "session", "allow");
-			onSessionRulesChanged();
-			ctx.ui.notify("Added exact bash allow rule for this session.", "info");
-			return undefined;
+	const allowedOnceIndexes = new Set<number>();
+	let promptStage: "action" | "save" = "action";
+	while (true) {
+		const evaluation = evaluateBashAnalysis(analysis, allowedOnceIndexes, bashAllowRules, bashDenyRules, activeConfig);
+		if (evaluation.denied) {
+			return {
+				block: true,
+				reason: `Bash sub-command denied by ${ruleLabel(evaluation.denied.ruleDecision!.rule)}: ${formatDisplayedBashCommand(evaluation.denied)}`,
+			} as const;
 		}
+		if (evaluation.pendingDangerous.length === 0) return undefined;
+
+		if (!ctx.hasUI) {
+			return {
+				block: true,
+				reason: `Bash command blocked because no UI is available to approve dangerous sub-commands.\n${formatBashAnalysis(analysis)}`,
+			} as const;
+		}
+
+		const target = evaluation.pendingDangerous[0]!;
+		const decision = await selectBashDecision(ctx, evaluation, analysis, target.index, activeConfig, promptStage);
+		promptStage = "action";
+		if (!decision || decision.type === "block") return { block: true, reason: "Blocked by user" } as const;
+		if (decision.type === "allow-once") return undefined;
+
+		if (decision.mode === "exact") {
+			if (decision.scope === "session") {
+				addExactRule(target.command, bashAllowRules, "session", "allow");
+				onSessionRulesChanged();
+				ctx.ui.notify("Added exact bash allow rule for this sub-command in this session.", "info");
+				promptStage = "save";
+				continue;
+			}
+
+			try {
+				await addPersistentRule(ctx, decision.scope, "allow", exactRuleSource(target.command));
+				activeConfig = await loadConfigs(ctx.cwd);
+				ctx.ui.notify(`Added exact bash allow rule for this sub-command in ${decision.scope} scope.`, "info");
+				promptStage = "save";
+				continue;
+			} catch (error: any) {
+				ctx.ui.notify(`Could not save ${decision.scope} rule: ${error.message}`, "error");
+				return { block: true, reason: `Could not save ${decision.scope} rule: ${error.message}` } as const;
+			}
+		}
+
+		const source = await ctx.ui.input("Bash allow regex for sub-command", "Example: ^ssh\\b");
+		if (!source) return { block: true, reason: "Blocked by user" } as const;
 
 		try {
-			await addPersistentRule(ctx, decision.scope, "allow", exactRuleSource(command));
-			ctx.ui.notify(`Added exact bash allow rule for this ${decision.scope}.`, "info");
-			return undefined;
+			const regex = new RegExp(source);
+			if (decision.scope === "session") {
+				bashAllowRules.push({ source, regex, scope: "session", list: "allow" });
+				onSessionRulesChanged();
+				ctx.ui.notify(`Added session bash allow rule for sub-commands: /${source}/`, "info");
+			} else {
+				await addPersistentRule(ctx, decision.scope, "allow", source);
+				activeConfig = await loadConfigs(ctx.cwd);
+				ctx.ui.notify(`Added ${decision.scope} bash allow rule for sub-commands: /${source}/`, "info");
+			}
+
+			regex.lastIndex = 0;
+			if (regex.test(target.command)) {
+				promptStage = "save";
+				continue;
+			}
+			return { block: true, reason: `Added regex /${source}/ does not match this sub-command: ${target.command}` } as const;
 		} catch (error: any) {
-			ctx.ui.notify(`Could not save ${decision.scope} rule: ${error.message}`, "error");
-			return { block: true, reason: `Could not save ${decision.scope} rule: ${error.message}` } as const;
+			ctx.ui.notify(`Invalid regex: ${error.message}`, "error");
+			return { block: true, reason: `Invalid regex: ${error.message}` } as const;
 		}
-	}
-
-	const source = await ctx.ui.input("Bash allow regex", "Example: ^ssh\\b");
-	if (!source) return { block: true, reason: "Blocked by user" } as const;
-
-	try {
-		const regex = new RegExp(source);
-		if (decision.scope === "session") {
-			bashAllowRules.push({ source, regex, scope: "session", list: "allow" });
-			onSessionRulesChanged();
-			ctx.ui.notify(`Added session bash allow rule: /${source}/`, "info");
-		} else {
-			await addPersistentRule(ctx, decision.scope, "allow", source);
-			ctx.ui.notify(`Added ${decision.scope} bash allow rule: /${source}/`, "info");
-		}
-
-		regex.lastIndex = 0;
-		if (regex.test(command)) return undefined;
-		return { block: true, reason: `Added regex /${source}/ does not match this command` } as const;
-	} catch (error: any) {
-		ctx.ui.notify(`Invalid regex: ${error.message}`, "error");
-		return { block: true, reason: `Invalid regex: ${error.message}` } as const;
 	}
 }
 
@@ -940,7 +1014,7 @@ export default function simplePermissions(pi: ExtensionAPI) {
 
 	const registerRuleCommand = (name: string, list: BashRuleList, exact: boolean) => {
 		pi.registerCommand(name, {
-			description: `${list === "allow" ? "Allow" : "Deny"} ${exact ? "one exact" : "matching"} bash command${exact ? "" : "s"}. Usage: /${name} [session|directory|repo|global] <${exact ? "command" : "regex"}>`,
+			description: `${list === "allow" ? "Allow" : "Deny"} ${exact ? "one exact" : "matching"} bash sub-command${exact ? "" : "s"}. Usage: /${name} [session|directory|repo|global] <${exact ? "command" : "regex"}>`,
 			handler: async (args, ctx) => {
 				const { scope, value } = splitOptionalScope(args);
 				if (!value) {
@@ -1071,17 +1145,14 @@ export default function simplePermissions(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			"\n\nPermission policy active: read/list/search tools are allowed; write/edit targets inside the current working directory are allowed; write/edit targets outside the current working directory require user confirmation; agent bash tool calls are parsed with tree-sitter-bash and each simple command is classified as harmless or potentially harmful. Fully harmless bash lines are allowed automatically; potentially harmful agent bash tool calls require confirmation unless they match a session, directory, repo, or global bash allow regex. Matching deny regexes override allows and block the bash tool call.",
+			"\n\nPermission policy active: read/list/search tools are allowed; write/edit targets inside the current working directory are allowed; write/edit targets outside the current working directory require user confirmation; agent bash tool calls are parsed with tree-sitter-bash and each simple command is classified as harmless or potentially harmful. Bash allow/deny rules apply to each parsed sub-command, not the whole line. Fully harmless bash lines are allowed automatically unless a deny rule matches one of their parsed sub-commands. Potentially harmful sub-commands require approval unless they match a session, directory, repo, or global allow regex. Matching deny regexes override allows and block the bash tool call.",
 	}));
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "bash") {
 			const command = String((event.input as any).command ?? "");
 			const config = await loadConfigs(ctx.cwd);
-			const decision = bashRuleDecision(command, bashAllowRules, bashDenyRules, config);
-			if (decision?.type === "allow") return undefined;
-			if (decision?.type === "deny") return { block: true, reason: `Bash command denied by ${ruleLabel(decision.rule)}` } as const;
-			return confirmBash(ctx, command, bashAllowRules, config, saveSessionRules);
+			return confirmBash(ctx, command, bashAllowRules, bashDenyRules, config, saveSessionRules);
 		}
 
 		if (!WRITING_TOOLS.has(event.toolName)) return undefined;
