@@ -1,10 +1,13 @@
 import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // tree-sitter and tree-sitter-bash are CommonJS packages without consistently
-// available TS declarations in extension runtimes, so load them lazily via
-// dynamic import and keep their values typed as any.
+// available TS declarations in extension runtimes, so load them lazily and
+// keep their values typed as any.
 type BashRuleScope = "session" | "directory" | "repo" | "global";
 type PersistentBashRuleScope = Exclude<BashRuleScope, "session">;
 type BashRuleList = "allow" | "deny";
@@ -149,6 +152,40 @@ const FIND_MUTATING_FLAGS = new Set(["-delete", "-exec", "-execdir", "-ok", "-ok
 let bashParserPromise: Promise<{ parser: any | null; error?: string }> | undefined;
 let configCache: LoadedConfigState | undefined;
 let configLoadPromise: { cwd: string; promise: Promise<LoadedConfigState> } | undefined;
+const extensionFilePath = fileURLToPath(import.meta.url);
+const extensionDir = dirname(extensionFilePath);
+const extensionFileRequire = createRequire(import.meta.url);
+const DIRECT_MODULE_ENTRY_CANDIDATES: Record<string, string[]> = {
+	"tree-sitter": ["node_modules/tree-sitter/index.js"],
+	"tree-sitter-bash": ["node_modules/tree-sitter-bash/bindings/node/index.js"],
+};
+
+function collectRequireBases(): string[] {
+	const seen = new Set<string>();
+	const bases: string[] = [];
+	const add = (value: string) => {
+		const dir = resolve(value);
+		if (seen.has(dir)) return;
+		seen.add(dir);
+		bases.push(dir);
+	};
+
+	add(extensionDir);
+	add(resolve(extensionDir, ".."));
+	add(process.cwd());
+
+	for (const start of [...bases]) {
+		let current = start;
+		while (true) {
+			add(current);
+			const parent = dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+	}
+
+	return bases;
+}
 
 function stripAtPrefix(path: string): string {
 	return path.startsWith("@") ? path.slice(1) : path;
@@ -510,19 +547,90 @@ async function confirmFileMutation(ctx: any, toolName: string, requestedPath: st
 	return ok ? undefined : ({ block: true, reason: "Blocked by user" } as const);
 }
 
+function withBunCompat<T>(load: () => T): T {
+	if (typeof process.versions.bun !== "string") return load();
+
+	const versions = process.versions as NodeJS.ProcessVersions & { bun?: string };
+	const descriptor = Object.getOwnPropertyDescriptor(versions, "bun");
+	const hadBun = Object.prototype.hasOwnProperty.call(versions, "bun");
+	const bunVersion = versions.bun;
+
+	try {
+		if (descriptor?.writable) versions.bun = undefined;
+		else if (descriptor?.configurable) delete versions.bun;
+		return load();
+	} finally {
+		if (!hadBun) return;
+		if (descriptor) Object.defineProperty(versions, "bun", { ...descriptor, value: bunVersion });
+		else if (bunVersion) versions.bun = bunVersion;
+	}
+}
+
+function tryLoadWithRequire(requireFn: NodeJS.Require, request: string, attempted: string[], lastErrorRef: { value: unknown }) {
+	attempted.push(request);
+	try {
+		return { loaded: true as const, value: requireFn(request) };
+	} catch (error) {
+		lastErrorRef.value = error;
+		return { loaded: false as const };
+	}
+}
+
+function resolveDirectModuleEntryPaths(moduleName: string, bases: string[]): string[] {
+	const seen = new Set<string>();
+	const paths: string[] = [];
+	for (const relativeEntry of DIRECT_MODULE_ENTRY_CANDIDATES[moduleName] ?? []) {
+		for (const base of bases) {
+			const entryPath = join(base, relativeEntry);
+			if (!existsSync(entryPath) || seen.has(entryPath)) continue;
+			seen.add(entryPath);
+			paths.push(entryPath);
+		}
+	}
+	return paths;
+}
+
+function requireExtensionDependency(moduleName: string): any {
+	return withBunCompat(() => {
+		const attempted: string[] = [];
+		const lastErrorRef: { value: unknown } = { value: undefined };
+		const bases = collectRequireBases();
+
+		for (const base of bases) {
+			const packageJsonPath = join(base, "package.json");
+			if (!existsSync(packageJsonPath)) continue;
+			const result = tryLoadWithRequire(createRequire(packageJsonPath), moduleName, attempted, lastErrorRef);
+			if (result.loaded) return result.value;
+		}
+
+		const extensionResult = tryLoadWithRequire(extensionFileRequire, moduleName, attempted, lastErrorRef);
+		if (extensionResult.loaded) return extensionResult.value;
+
+		for (const entryPath of resolveDirectModuleEntryPaths(moduleName, bases)) {
+			const result = tryLoadWithRequire(extensionFileRequire, entryPath, attempted, lastErrorRef);
+			if (result.loaded) return result.value;
+		}
+
+		const detail = lastErrorRef.value instanceof Error ? (lastErrorRef.value.stack ?? lastErrorRef.value.message) : String(lastErrorRef.value);
+		throw new Error(`Unable to load ${moduleName}. Attempted roots:\n${attempted.join("\n")}\n\nLast error: ${detail}`);
+	});
+}
+
+function moduleDefault<T>(value: T): T {
+	return ((value as any)?.default ?? value) as T;
+}
+
+function mutableModuleExports<T extends object>(value: T): T {
+	return Object.assign({}, value);
+}
+
 async function getBashParser(): Promise<{ parser: any | null; error?: string }> {
 	bashParserPromise ??= (async () => {
 		try {
-			const ParserModule: any = await import("tree-sitter");
-			const BashModule: any = await import("tree-sitter-bash");
-			const Parser = ParserModule.default ?? ParserModule;
-			// Bun freezes ESM namespace objects. tree-sitter's setLanguage attaches
-			// state to the language module, which throws "Attempted to assign to
-			// readonly property" on a frozen namespace. Copy into a plain mutable
-			// object so the native binding can write to it.
-			const BashExports = BashModule.default ?? BashModule;
-			const Bash: any = {};
-			for (const key of Object.keys(BashExports)) Bash[key] = BashExports[key];
+			const Parser = moduleDefault<any>(requireExtensionDependency("tree-sitter"));
+			// Bun can freeze ESM namespace objects. tree-sitter mutates the language
+			// object during setLanguage(), so clone exports into a plain mutable object.
+			const Bash = mutableModuleExports(moduleDefault<any>(requireExtensionDependency("tree-sitter-bash")));
 			const parser = new Parser();
 			parser.setLanguage(Bash);
 			return { parser };
@@ -1137,7 +1245,6 @@ export default function simplePermissions(pi: ExtensionAPI) {
 		const config = await loadConfigs(ctx.cwd);
 		const warnings = [...sessionRuleErrors, ...config.errors];
 		if (ctx.hasUI) {
-			ctx.ui.setStatus("simple-permissions", ctx.ui.theme.fg("accent", "perm: cwd-write + agent-bash-risk"));
 			if (warnings.length > 0) ctx.ui.notify(`simple-permissions warnings:\n${warnings.join("\n")}`, "warning");
 		}
 	});

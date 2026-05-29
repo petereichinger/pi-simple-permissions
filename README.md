@@ -33,6 +33,8 @@ pi -e git:github.com/petereichinger/pi-simple-permissions
 pi -e /path/to/pi-simple-permissions
 ```
 
+This extension depends on `tree-sitter` and `tree-sitter-bash`. In plain Node.js, normal package resolution is usually enough. In pi's compiled runtime, bare package resolution for extension dependencies can fail even when the packages are installed. The extension therefore falls back to direct `node_modules` entry paths for those parser packages.
+
 ## Commands
 
 ### Allow and deny rules
